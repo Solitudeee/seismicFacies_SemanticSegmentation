@@ -42,29 +42,29 @@ class _SimpleSegmentationModel(nn.Module):
 
         features1 = self.backbone1(x0, gini)  # out是2048个feature_map；low_level是256个feature_map
         features2 = self.backbone2(x1, gini)
-        feature = OrderedDict()
-        # print("out:",features1['out'].size())
-        # print("low_level1:",features1['low_level1'].size())
-        # print("low_level2:",features1['low_level2'].size())
-        # print("low_level3:",features1['low_level3'].size())
+        # feature = OrderedDict()
+        # # print("out:",features1['out'].size())
+        # # print("low_level1:",features1['low_level1'].size())
+        # # print("low_level2:",features1['low_level2'].size())
+        # # print("low_level3:",features1['low_level3'].size())
+        #
+        # features2['out'] = self.conv4(features2['out'])
+        # features2['low_level1'] = self.conv1(features2['low_level1'])
+        # features2['low_level2'] = self.conv2(features2['low_level2'])
+        # features2['low_level3'] = self.conv3(features2['low_level3'])
+        #
+        # feature['out'] = torch.cat((features1['out'], features2['out']), dim=1)
+        # feature['low_level1'] = torch.cat((features1['low_level1'], features2['low_level1']), dim=1)
+        # feature['low_level2'] = torch.cat((features1['low_level2'], features2['low_level2']), dim=1)
+        # feature['low_level3'] = torch.cat((features1['low_level3'], features2['low_level3']), dim=1)
+        #
+        # #加通道注意力
+        # # feature['out'] = self.sc4(feature['out'])
+        # # feature['low_level1'] = self.sc1(feature['low_level1'])
+        # # feature['low_level2'] = self.sc2(feature['low_level2'])
+        # # feature['low_level3'] = self.sc3(feature['low_level3'])
 
-        features2['out'] = self.conv4(features2['out'])
-        features2['low_level1'] = self.conv1(features2['low_level1'])
-        features2['low_level2'] = self.conv2(features2['low_level2'])
-        features2['low_level3'] = self.conv3(features2['low_level3'])
-
-        feature['out'] = torch.cat((features1['out'], features2['out']), dim=1)
-        feature['low_level1'] = torch.cat((features1['low_level1'], features2['low_level1']), dim=1)
-        feature['low_level2'] = torch.cat((features1['low_level2'], features2['low_level2']), dim=1)
-        feature['low_level3'] = torch.cat((features1['low_level3'], features2['low_level3']), dim=1)
-
-        #加通道注意力
-        # feature['out'] = self.sc4(feature['out'])
-        # feature['low_level1'] = self.sc1(feature['low_level1'])
-        # feature['low_level2'] = self.sc2(feature['low_level2'])
-        # feature['low_level3'] = self.sc3(feature['low_level3'])
-
-        x = self.classifier(feature, gini)
+        x = self.classifier(features1,features2, gini)
         x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=False)
         return x
 

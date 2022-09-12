@@ -269,10 +269,10 @@ def resnet50(pretrained=False, progress=True, **kwargs):
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    # return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress,
-    #                **kwargs)
-    return _resnet('resnet50', Bottleneck, [1,1,1,1], pretrained, progress,
-                       **kwargs)
+    return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress,
+                   **kwargs)
+    # return _resnet('resnet50', Bottleneck, [1,1,1,1], pretrained, progress,
+    #                    **kwargs)
 
 def resnet101(pretrained=False, progress=True, **kwargs):
     r"""ResNet-101 model from

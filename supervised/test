@@ -126,17 +126,14 @@ class Attention(nn.Module):
         self.scale = dim_head ** -0.5
         inner_dim = heads * dim_head
 
-        self.to_qkv = nn.Conv2d(256, inner_dim * 3, 1, bias=False)
+        self.to_qkv = nn.Conv2d(dim, inner_dim * 3, 1, bias=False)
 
-        self.to_k2 = nn.Conv2d(2048, inner_dim, 1, bias=False)
-        self.to_k3 = nn.Conv2d(48, inner_dim, 1, bias=False)
+        self.to_k2 = nn.Conv2d(dim, inner_dim, 1, bias=False)
+        self.to_k3 = nn.Conv2d(dim, inner_dim, 1, bias=False)
         # rel_pos_class = AbsPosEmb if not rel_pos_emb else RelPosEmb
         # self.pos_emb = rel_pos_class(fmap_size, dim_head)
-        self.cov1x1 = conv1x1(256*3,256)
-        self.alpha1 = nn.Parameter(torch.ones(2, 2, 1, 1)) #B C H W
-        self.alpha2 = nn.Parameter(torch.ones(2, 2, 1, 1))
 
-    def forward(self, fmap,x):
+    def forward(self, fmap, x, y):
         heads, b, c, h, w = self.heads, *fmap.shape
 
         q, k1, v = self.to_qkv(fmap).chunk(3, dim=1)
@@ -144,21 +141,20 @@ class Attention(nn.Module):
 
         k2 = self.to_k2(x)
         k2 = rearrange(k2, 'b (h d) x y -> b h (x y) d', h=heads)
-        # k2 = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h=heads), (q2, k2))
 
-        # k3 = self.to_k3(y)
+        k3 = self.to_k3(y)
         # k3 = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h=heads), (k3,))
-        # k3 = rearrange(k3, 'b (h d) x y -> b h (x y) d', h=heads)
-        # q3, k3 = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h=heads), (q3, k3))
+        k3 = rearrange(k3, 'b (h d) x y -> b h (x y) d', h=heads)
 
         q = q * self.scale
 
         sim1 = einsum('b h i d, b h j d -> b h i j', q, k1)
         sim2 = einsum('b h i d, b h j d -> b h i j', q, k2)
-        # sim3 = einsum('b h i d, b h j d -> b h i j', q, k3)
+        sim3 = einsum('b h i d, b h j d -> b h i j', q, k3)
 
-        sim = sim1 + sim2
 
+
+        sim = sim1 + sim2 + sim3
 
         attn = sim.softmax(dim=-1)
 
@@ -175,52 +171,72 @@ def conv1x1(in_planes, out_planes, stride=1):
 class DeepLabHeadV3Plus(nn.Module):
     def __init__(self, in_channels, low_level_channels, num_classes, aspp_dilate=[12, 24, 36]):
         super(DeepLabHeadV3Plus, self).__init__()
-        self.project = nn.Sequential(
-            nn.Conv2d(low_level_channels, 48, 1, bias=False),
+        # print("####",low_level_channels)
+        p = 8
+        low_level_channels_1 = 256 + 256 // p  # 修改通道
+        low_level_channels_2 = 512 + 512 // p  # 修改通道
+        low_level_channels_3 = 1024 + 1024 // p  # 修改通道
+        self.project1 = nn.Sequential(
+            nn.Conv2d(low_level_channels_1, 48, 1, bias=False),
             nn.BatchNorm2d(48),
             nn.ReLU(inplace=True),
         )
-
-        self.project1 = nn.Sequential(
-            nn.Conv2d(2048, 256, 1, bias=False),
-            nn.BatchNorm2d(256),
+        self.project2 = nn.Sequential(
+            nn.Conv2d(low_level_channels_2, 96, 1, bias=False),
+            nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
         )
-
-
-        self.aspp = ASPP(2304, aspp_dilate)
-        self.aspp2 = ASPP(2048, aspp_dilate)
+        self.project3 = nn.Sequential(
+            nn.Conv2d(low_level_channels_3, 192, 1, bias=False),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+        )
+        # print("####in_channels", in_channels)
+        in_channels = 2048 + 2048 // p  # 修改通道
+        self.aspp = ASPP(2048, aspp_dilate)
 
         self.classifier = nn.Sequential(
-            nn.Conv2d(304, 256, 3, padding=1, bias=False),
+            nn.Conv2d(256, 256, 3, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, num_classes, 1)
         )
         self._init_weight()
-        self.at = Attention(dim=256)
-        self.cam = CAM_Module(in_dim=2304)
 
+        # self.sc1 = CAM_Module(864)  # 通道注意力模块
+        # self.sc2 = CAM_Module(2016)  # 通道注意力模块
+        # self.sc3 = CAM_Module(4320)  # 通道注意力模块
+        # self.sc3 = CAM_Module(592)  # 通道注意力模块
+        # self.sa3 = PAM_Module(592)  # 空间注意力模块
+        self.at = Attention(dim=256)
+        self.conv1 = conv1x1(1024, 256)
+        # self.conv2 = conv1x1(512, 64)
+        # self.conv3 = conv1x1(1024, 128)
+        # self.conv4 = conv1x1(2048, 256)
 
     def forward(self, features1, features2, gini=None):
-        low_level_feature = self.project(features1['low_level1'])
+        print(features1['out'].size())
 
-        output_feature = self.cam(torch.cat([features1['out'], self.project1(features2['out'])],dim=1))
-
-        output_feature = self.aspp(output_feature)
-
-        # output_feature = self.at(output_feature,features2['out'])
-
-        output_feature = F.interpolate(output_feature, size=low_level_feature.shape[2:], mode='bilinear',
+        output_feature = self.aspp(features1['out'])
+        output_feature = F.interpolate(output_feature, size=features1['low_level3'].shape[2:], mode='bilinear',
                                        align_corners=False)
-        #
-        # output_feature2 = self.aspp2(features2['out'])
-        # output_feature2 = F.interpolate(output_feature2, size=low_level_feature.shape[2:], mode='bilinear',
-        #                                align_corners=False)
+        # print(1, output_feature.size())
+        # print(2, features1['low_level3'].size())
+        # print(3, features2['low_level3'].size())
+        out3 = self.at(output_feature, self.conv1(features1['low_level3']), self.conv1(features2['low_level3']))
+        out3 = einsum('b h i d, b h j d -> b h i j', output_feature, out3)
 
-        return self.classifier(torch.cat([low_level_feature, output_feature], dim=1))
+        # out3 = F.interpolate(low_level_feature2, size=low_level_feature1.shape[2:], mode='bilinear',
+        #                                    align_corners=False)
+        # low_level_feature3 = F.interpolate(low_level_feature3, size=low_level_feature1.shape[2:], mode='bilinear',
+        #                                    align_corners=False)
+        # out = torch.cat([low_level_feature1, low_level_feature2], dim=1)
+        # out = torch.cat([out, low_level_feature3], dim=1)
+        # out = torch.cat([out, output_feature], dim=1)
 
-
+        # out = self.sc3(out)
+        # print(out3.size())
+        return self.classifier(out3)
 
     def _init_weight(self):
         for m in self.modules():
@@ -354,3 +370,4 @@ def convert_to_separable_conv(module):
     for name, child in module.named_children():
         new_module.add_module(name, convert_to_separable_conv(child))
     return new_module
+
