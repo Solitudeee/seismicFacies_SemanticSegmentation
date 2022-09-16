@@ -32,7 +32,7 @@ Validation_N = 82  # 测试集样本个数
 Validation_batch_size = 2
 
 N = 700
-save_batchs = [0,80, 160, 240, 350]
+save_batchs = [80, 160, 240, 349]
 labeledIndex_path = 'train.txt'
 validateIndex_path = 'validation.txt'
 
@@ -115,9 +115,9 @@ aveJ_train_dot = []
 loss_train = []
 loss_train_dot = []
 
-pre_epoch = -1
+pre_epoch = 0
 
-# # #加载模型：
+# #加载模型：
 # PATH_l = checkpointPath + "checkpoint_0_epoch-349_l.pkl"
 # checkpoint_l = torch.load(PATH_l, map_location='cpu')
 # model_left.load_state_dict(checkpoint_l['model_state_dict'])
@@ -135,7 +135,6 @@ pre_epoch = -1
 # recall_validation = checkpoint_l['recall_validation']
 # recall_validation1 = checkpoint_l['recall_validation1']
 # recall_validation2 = checkpoint_l['recall_validation2']
-
 for epoch in range(pre_epoch + 1, total_epoch):
     for batchs in range(N // batch_size):
         print(epoch, '/', total_epoch, '--', batchs, '/', N // batch_size, '============================')
@@ -159,24 +158,23 @@ for epoch in range(pre_epoch + 1, total_epoch):
 
 
         # *******将数据输入网络******
-        if epoch > 100:
-            if hasattr(torch.cuda, 'empty_cache'):
-                torch.cuda.empty_cache()
-            gini = torch.FloatTensor(getGini(gini_path, names, epoch - 1)).to(device)
-            if hasattr(torch.cuda, 'empty_cache'):
-                torch.cuda.empty_cache()
-            pred_l = interp(model_left(labeled_x0, labeled_x1, gini))
-            if hasattr(torch.cuda, 'empty_cache'):
-                torch.cuda.empty_cache()
+        # if epoch > -1:
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+        gini = torch.FloatTensor(getGini(gini_path, names, epoch - 1)).to(device)
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+        pred_l = interp(model_left(labeled_x0, labeled_x1, gini))
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
 
-        else:
+        # else:
+        #     pred_l = interp(model_left(labeled_x0, labeled_x1))
+        #     if hasattr(torch.cuda, 'empty_cache'):
+        #         torch.cuda.empty_cache()
 
-            pred_l = interp(model_left(labeled_x0, labeled_x1))
-            if hasattr(torch.cuda, 'empty_cache'):
-                torch.cuda.empty_cache()
 
-
-        # saveGini(pred_l, gini_path, names, epoch - 1)
+        saveGini(pred_l, gini_path, names, epoch)
 
         _, max_l = torch.max(pred_l, dim=1)  # 第一个模型的输出结果
 
@@ -241,8 +239,15 @@ for epoch in range(pre_epoch + 1, total_epoch):
 
                     interp = nn.Upsample(size=(data_shape[1], data_shape[2]), mode='bilinear',
                                          align_corners=True).float()
-                    validation_out = interp(model_left(validation_x0, validation_x1))
+                    if epoch==1 and batchs==80:
+                        gini = torch.FloatTensor(getGini(gini_path, ['300.csv','303.csv'], 0)).to(device)
+                        validation_out = interp(model_left(validation_x0, validation_x1, gini))
+                    else:
+                        gini = torch.FloatTensor(getGini(gini_path, data['names'], -1)).to(device)
+                        validation_out = interp(model_left(validation_x0, validation_x1, gini))
                     _, max_test = torch.max(validation_out, dim=1)  # 第一个模型的输出结果
+
+                    saveGini(validation_out, gini_path, data['names'], -1)
 
                     loss_test = loss_func(validation_out, validation_y)
 

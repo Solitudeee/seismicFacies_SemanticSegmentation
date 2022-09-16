@@ -1,6 +1,7 @@
 import torch
 from torch import nn, einsum
 from torch.nn import functional as F
+import torch.nn.utils.spectral_norm as spectral_norm
 
 from utils import _SimpleSegmentationModel
 from einops import rearrange
@@ -166,6 +167,71 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x=h, y=w)
         return out
 
+class CAM_Module_my(nn.Module):
+    """ Channel attention module"""
+
+    def __init__(self, in_dim):
+        super(CAM_Module_my, self).__init__()
+        self.chanel_in = in_dim
+
+        self.gamma = nn.Parameter(torch.zeros(1))  # β尺度系数初始化为0，并逐渐地学习分配到更大的权重
+        self.softmax = nn.Softmax(dim=-1)  # 对每一行进行softmax
+        self.bate = nn.Parameter(torch.zeros(1))  # β尺度系数初始化为0，并逐渐地学习分配到更大的权重
+
+    def forward(self, x,y):
+        """
+            inputs :
+                x : input feature maps( B × C × H × W)
+            returns :
+                out : attention value + input feature
+                attention: B × C × C
+        """
+        #-----------------X-----------
+        m_batchsize, C, height, width = x.size()
+        # A -> (N,C,HW)
+        proj_query = x.view(m_batchsize, C, -1)
+        print(proj_query.size())
+        # A -> (N,HW,C)
+        proj_key = x.view(m_batchsize, C, -1).permute(0, 2, 1)
+        print(proj_key.size())
+        # 矩阵乘积，通道注意图：X -> (N,C,C)
+        energy = torch.bmm(proj_query, proj_key)
+        print(energy.size())
+        # 这里实现了softmax用最后一维的最大值减去了原始数据，获得了一个不是太大的值
+        # 沿着最后一维的C选择最大值，keepdim保证输出和输入形状一致，除了指定的dim维度大小为1
+        # expand_as表示以复制的形式扩展到energy的尺寸
+        energy_new = torch.max(energy, -1, keepdim=True)[0].expand_as(energy) - energy
+        print(energy_new.size())
+        # -----------------Y-----------
+        m_batchsize_y, C_y, height_y, width_y = y.size()
+        # A -> (N,C,HW)
+        proj_query_y = y.view(m_batchsize_y, C_y, -1)
+        # A -> (N,HW,C)
+        proj_key_y = y.view(m_batchsize_y, C_y, -1).permute(0, 2, 1)
+        # 矩阵乘积，通道注意图：X -> (N,C,C)
+        energy_y = torch.bmm(proj_query_y, proj_key_y)
+        # 这里实现了softmax用最后一维的最大值减去了原始数据，获得了一个不是太大的值
+        # 沿着最后一维的C选择最大值，keepdim保证输出和输入形状一致，除了指定的dim维度大小为1
+        # expand_as表示以复制的形式扩展到energy的尺寸
+        energy_new_y = torch.max(energy_y, -1, keepdim=True)[0].expand_as(energy_y) - energy_y
+        # -----------------合并-----------
+        # attention = self.softmax(energy_new+self.bate*energy_new_y)
+        attention = self.softmax(energy_new)
+        print(attention.size())
+        # A -> (N,C,HW)
+        proj_value = x.view(m_batchsize, C, -1)
+        print(proj_value.size())
+        # XA -> （N,C,HW）
+        out = torch.bmm(attention, proj_value)
+        print(out.size())
+        # output -> (N,C,H,W)
+        out = out.view(m_batchsize, C, height, width)
+        print(out.size())
+
+        out = self.gamma * out + x
+        return out
+
+
 
 def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
@@ -186,10 +252,14 @@ class DeepLabHeadV3Plus(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
+        self.project2 = nn.Sequential(
+            nn.Conv2d(2304, 256, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
 
 
         self.aspp = ASPP(2304, aspp_dilate)
-        self.aspp2 = ASPP(2048, aspp_dilate)
 
         self.classifier = nn.Sequential(
             nn.Conv2d(304, 256, 3, padding=1, bias=False),
@@ -200,24 +270,18 @@ class DeepLabHeadV3Plus(nn.Module):
         self._init_weight()
         self.at = Attention(dim=256)
         self.cam = CAM_Module(in_dim=2304)
+        self.cgc = CondGatedConv2d(in_channels=2304,out_channels=256,label_nc=1,kernel_size=3)
 
 
     def forward(self, features1, features2, gini=None):
         low_level_feature = self.project(features1['low_level1'])
-
         output_feature = self.cam(torch.cat([features1['out'], self.project1(features2['out'])],dim=1))
 
+        output_feature = self.cgc(output_feature,gini)
         output_feature = self.aspp(output_feature)
-
-        # output_feature = self.at(output_feature,features2['out'])
 
         output_feature = F.interpolate(output_feature, size=low_level_feature.shape[2:], mode='bilinear',
                                        align_corners=False)
-        #
-        # output_feature2 = self.aspp2(features2['out'])
-        # output_feature2 = F.interpolate(output_feature2, size=low_level_feature.shape[2:], mode='bilinear',
-        #                                align_corners=False)
-
         return self.classifier(torch.cat([low_level_feature, output_feature], dim=1))
 
 
@@ -354,3 +418,139 @@ def convert_to_separable_conv(module):
     for name, child in module.named_children():
         new_module.add_module(name, convert_to_separable_conv(child))
     return new_module
+
+
+class CondGatedConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, label_nc, kernel_size, stride=1, padding=0, dilation=1,
+                 pad_type='zero',
+                 activation='elu', norm='bn', sn=False):
+        super(CondGatedConv2d, self).__init__()
+
+        self.out_channels = out_channels
+
+        # Initialize the padding scheme
+        if pad_type == 'reflect':
+            self.pad = nn.ReflectionPad2d(padding)
+        elif pad_type == 'replicate':
+            self.pad = nn.ReplicationPad2d(padding)
+        elif pad_type == 'zero':
+            self.pad = nn.ZeroPad2d(padding)
+        else:
+            assert 0, "Unsupported padding type: {}".format(pad_type)
+
+        # Initialize the normalization type
+        if norm == 'bn':
+            self.norm = nn.BatchNorm2d(2304)
+        elif norm == 'in':
+            self.norm = nn.InstanceNorm2d(2304)
+        elif norm == 'ln':
+            self.norm = nn.LayerNorm(2304)
+        elif norm == 'none':
+            self.norm = None
+        else:
+            assert 0, "Unsupported normalization: {}".format(norm)
+
+        # Initialize the activation funtion
+        if activation == 'relu':
+            self.activation = nn.ReLU(inplace=True)
+        elif activation == 'lrelu':
+            self.activation = nn.LeakyReLU(0.2, inplace=True)
+        elif activation == 'prelu':
+            self.activation = nn.PReLU()
+        elif activation == 'selu':
+            self.activation = nn.SELU(inplace=True)
+        elif activation == 'tanh':
+            self.activation = nn.Tanh()
+        elif activation == 'sigmoid':
+            self.activation = nn.Sigmoid()
+        elif activation == 'elu':
+            self.activation = nn.ELU(inplace=True)
+        elif activation == 'none':
+            self.activation = None
+        else:
+            assert 0, "Unsupported activation: {}".format(activation)
+
+        # Initialize the convolution layers
+        if sn:
+            self.conv2d = spectral_norm(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation))
+            # self.mask_conv2d = spectral_norm(
+            # nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation))
+        else:
+            self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation)
+            # self.mask_conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation)
+        self.sigmoid = torch.nn.Sigmoid()
+
+        ####### mod 1 ########
+        # nhidden = out_channels // 2
+        # nhidden = 128
+        nhidden = 1024
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(in_channels, nhidden, kernel_size=3, stride=stride, padding=1),
+            nn.ReLU()
+        )
+        self.mlp_gamma = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+
+        ####### mod 2 ########
+        self.mlp_shared_2 = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
+        )
+        self.mlp_shared_3 = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
+        )
+
+        self.mlp_gamma_ctx_gamma = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta_ctx_gamma = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+
+        self.mlp_gamma_ctx_beta = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta_ctx_beta = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+
+        self.alpha1 = nn.Parameter(torch.zeros(2, 256, 72, 124))
+        self.alpha2 = nn.Parameter(torch.zeros(2, 256, 72, 124))
+        self.project1 = nn.Sequential(
+            nn.Conv2d(256, 2304, 1, bias=False),
+            nn.BatchNorm2d(2304),
+            nn.ReLU(inplace=True),
+        )
+
+
+    def forward(self, x, gini):
+        # print(x.size())  #torch.Size([2, 2304, 74, 126])
+        conv = self.conv2d(x)   #torch.Size([2, 256, 72, 124])
+        norm = self.norm(x)    #torch.Size([2, 2304, 74, 126])
+
+        ####### mod 2 ########
+        gini = F.interpolate(gini, size=conv.size()[2:], mode='nearest')
+        gini_F = 1-gini
+
+        ctx1 = self.mlp_shared_2(gini)
+        ctx2 = self.mlp_shared_3(gini_F)
+        gamma_ctx_gamma = self.mlp_gamma_ctx_gamma(ctx1)
+        beta_ctx_gamma = self.mlp_beta_ctx_gamma(ctx1)
+        gamma_ctx_beta = self.mlp_gamma_ctx_beta(ctx2)
+        beta_ctx_beta = self.mlp_beta_ctx_beta(ctx2)
+
+
+        ####### mod 1 ########
+        # x_conv = self.conv_x(x)
+        actv = self.mlp_shared(x)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+
+        gamma = F.interpolate(gamma, size=gamma_ctx_gamma.size()[2:], mode='nearest')
+        beta = F.interpolate(beta, size=gamma_ctx_beta.size()[2:], mode='nearest')
+        gamma = gamma * (1. + gamma_ctx_gamma) + beta_ctx_gamma
+        beta = beta * (1. + gamma_ctx_beta) + beta_ctx_beta
+
+        out_norm = conv * (1. + gamma+self.alpha1) + beta+self.alpha2
+        # if self.activation:
+        #     out = self.activation(out_norm)
+        out_norm = self.project1(out_norm)
+        gate = 1. + torch.tanh(out_norm)
+
+        gate = F.interpolate(gate, size=norm.size()[2:], mode='nearest')
+
+        return norm*gate

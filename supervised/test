@@ -1,6 +1,7 @@
 import torch
 from torch import nn, einsum
 from torch.nn import functional as F
+import torch.nn.utils.spectral_norm as spectral_norm
 
 from utils import _SimpleSegmentationModel
 from einops import rearrange
@@ -126,14 +127,17 @@ class Attention(nn.Module):
         self.scale = dim_head ** -0.5
         inner_dim = heads * dim_head
 
-        self.to_qkv = nn.Conv2d(dim, inner_dim * 3, 1, bias=False)
+        self.to_qkv = nn.Conv2d(256, inner_dim * 3, 1, bias=False)
 
-        self.to_k2 = nn.Conv2d(dim, inner_dim, 1, bias=False)
-        self.to_k3 = nn.Conv2d(dim, inner_dim, 1, bias=False)
+        self.to_k2 = nn.Conv2d(2048, inner_dim, 1, bias=False)
+        self.to_k3 = nn.Conv2d(48, inner_dim, 1, bias=False)
         # rel_pos_class = AbsPosEmb if not rel_pos_emb else RelPosEmb
         # self.pos_emb = rel_pos_class(fmap_size, dim_head)
+        self.cov1x1 = conv1x1(256*3,256)
+        self.alpha1 = nn.Parameter(torch.ones(2, 2, 1, 1)) #B C H W
+        self.alpha2 = nn.Parameter(torch.ones(2, 2, 1, 1))
 
-    def forward(self, fmap, x, y):
+    def forward(self, fmap,x):
         heads, b, c, h, w = self.heads, *fmap.shape
 
         q, k1, v = self.to_qkv(fmap).chunk(3, dim=1)
@@ -141,26 +145,92 @@ class Attention(nn.Module):
 
         k2 = self.to_k2(x)
         k2 = rearrange(k2, 'b (h d) x y -> b h (x y) d', h=heads)
+        # k2 = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h=heads), (q2, k2))
 
-        k3 = self.to_k3(y)
+        # k3 = self.to_k3(y)
         # k3 = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h=heads), (k3,))
-        k3 = rearrange(k3, 'b (h d) x y -> b h (x y) d', h=heads)
+        # k3 = rearrange(k3, 'b (h d) x y -> b h (x y) d', h=heads)
+        # q3, k3 = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h=heads), (q3, k3))
 
         q = q * self.scale
 
         sim1 = einsum('b h i d, b h j d -> b h i j', q, k1)
         sim2 = einsum('b h i d, b h j d -> b h i j', q, k2)
-        sim3 = einsum('b h i d, b h j d -> b h i j', q, k3)
+        # sim3 = einsum('b h i d, b h j d -> b h i j', q, k3)
 
+        sim = sim1 + sim2
 
-
-        sim = sim1 + sim2 + sim3
 
         attn = sim.softmax(dim=-1)
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x=h, y=w)
         return out
+
+class CAM_Module_my(nn.Module):
+    """ Channel attention module"""
+
+    def __init__(self, in_dim):
+        super(CAM_Module_my, self).__init__()
+        self.chanel_in = in_dim
+
+        self.gamma = nn.Parameter(torch.zeros(1))  # β尺度系数初始化为0，并逐渐地学习分配到更大的权重
+        self.softmax = nn.Softmax(dim=-1)  # 对每一行进行softmax
+        self.bate = nn.Parameter(torch.zeros(1))  # β尺度系数初始化为0，并逐渐地学习分配到更大的权重
+
+    def forward(self, x,y):
+        """
+            inputs :
+                x : input feature maps( B × C × H × W)
+            returns :
+                out : attention value + input feature
+                attention: B × C × C
+        """
+        #-----------------X-----------
+        m_batchsize, C, height, width = x.size()
+        # A -> (N,C,HW)
+        proj_query = x.view(m_batchsize, C, -1)
+        print(proj_query.size())
+        # A -> (N,HW,C)
+        proj_key = x.view(m_batchsize, C, -1).permute(0, 2, 1)
+        print(proj_key.size())
+        # 矩阵乘积，通道注意图：X -> (N,C,C)
+        energy = torch.bmm(proj_query, proj_key)
+        print(energy.size())
+        # 这里实现了softmax用最后一维的最大值减去了原始数据，获得了一个不是太大的值
+        # 沿着最后一维的C选择最大值，keepdim保证输出和输入形状一致，除了指定的dim维度大小为1
+        # expand_as表示以复制的形式扩展到energy的尺寸
+        energy_new = torch.max(energy, -1, keepdim=True)[0].expand_as(energy) - energy
+        print(energy_new.size())
+        # -----------------Y-----------
+        m_batchsize_y, C_y, height_y, width_y = y.size()
+        # A -> (N,C,HW)
+        proj_query_y = y.view(m_batchsize_y, C_y, -1)
+        # A -> (N,HW,C)
+        proj_key_y = y.view(m_batchsize_y, C_y, -1).permute(0, 2, 1)
+        # 矩阵乘积，通道注意图：X -> (N,C,C)
+        energy_y = torch.bmm(proj_query_y, proj_key_y)
+        # 这里实现了softmax用最后一维的最大值减去了原始数据，获得了一个不是太大的值
+        # 沿着最后一维的C选择最大值，keepdim保证输出和输入形状一致，除了指定的dim维度大小为1
+        # expand_as表示以复制的形式扩展到energy的尺寸
+        energy_new_y = torch.max(energy_y, -1, keepdim=True)[0].expand_as(energy_y) - energy_y
+        # -----------------合并-----------
+        # attention = self.softmax(energy_new+self.bate*energy_new_y)
+        attention = self.softmax(energy_new)
+        print(attention.size())
+        # A -> (N,C,HW)
+        proj_value = x.view(m_batchsize, C, -1)
+        print(proj_value.size())
+        # XA -> （N,C,HW）
+        out = torch.bmm(attention, proj_value)
+        print(out.size())
+        # output -> (N,C,H,W)
+        out = out.view(m_batchsize, C, height, width)
+        print(out.size())
+
+        out = self.gamma * out + x
+        return out
+
 
 
 def conv1x1(in_planes, out_planes, stride=1):
@@ -171,72 +241,45 @@ def conv1x1(in_planes, out_planes, stride=1):
 class DeepLabHeadV3Plus(nn.Module):
     def __init__(self, in_channels, low_level_channels, num_classes, aspp_dilate=[12, 24, 36]):
         super(DeepLabHeadV3Plus, self).__init__()
-        # print("####",low_level_channels)
-        p = 8
-        low_level_channels_1 = 256 + 256 // p  # 修改通道
-        low_level_channels_2 = 512 + 512 // p  # 修改通道
-        low_level_channels_3 = 1024 + 1024 // p  # 修改通道
-        self.project1 = nn.Sequential(
-            nn.Conv2d(low_level_channels_1, 48, 1, bias=False),
+        self.project = nn.Sequential(
+            nn.Conv2d(low_level_channels, 48, 1, bias=False),
             nn.BatchNorm2d(48),
             nn.ReLU(inplace=True),
         )
-        self.project2 = nn.Sequential(
-            nn.Conv2d(low_level_channels_2, 96, 1, bias=False),
-            nn.BatchNorm2d(96),
+
+        self.project1 = nn.Sequential(
+            nn.Conv2d(2048, 256, 1, bias=False),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
-        self.project3 = nn.Sequential(
-            nn.Conv2d(low_level_channels_3, 192, 1, bias=False),
-            nn.BatchNorm2d(192),
-            nn.ReLU(inplace=True),
-        )
-        # print("####in_channels", in_channels)
-        in_channels = 2048 + 2048 // p  # 修改通道
-        self.aspp = ASPP(2048, aspp_dilate)
+
+
+        self.aspp = ASPP(2304, aspp_dilate)
+        self.aspp2 = ASPP(2048, aspp_dilate)
 
         self.classifier = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1, bias=False),
+            nn.Conv2d(304, 256, 3, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, num_classes, 1)
         )
         self._init_weight()
-
-        # self.sc1 = CAM_Module(864)  # 通道注意力模块
-        # self.sc2 = CAM_Module(2016)  # 通道注意力模块
-        # self.sc3 = CAM_Module(4320)  # 通道注意力模块
-        # self.sc3 = CAM_Module(592)  # 通道注意力模块
-        # self.sa3 = PAM_Module(592)  # 空间注意力模块
         self.at = Attention(dim=256)
-        self.conv1 = conv1x1(1024, 256)
-        # self.conv2 = conv1x1(512, 64)
-        # self.conv3 = conv1x1(1024, 128)
-        # self.conv4 = conv1x1(2048, 256)
+        self.cam = CAM_Module(in_dim=2304)
+        self.cgc = CondGatedConv2d(in_channels=2304,out_channels=2304,label_nc=1,kernel_size=3)
+
 
     def forward(self, features1, features2, gini=None):
-        print(features1['out'].size())
-
-        output_feature = self.aspp(features1['out'])
-        output_feature = F.interpolate(output_feature, size=features1['low_level3'].shape[2:], mode='bilinear',
+        low_level_feature = self.project(features1['low_level1'])
+        output_feature = self.cam(torch.cat([features1['out'], self.project1(features2['out'])],dim=1))
+        if gini is not None:
+            output_feature = self.cgc(output_feature,gini)
+        output_feature = self.aspp(output_feature)
+        output_feature = F.interpolate(output_feature, size=low_level_feature.shape[2:], mode='bilinear',
                                        align_corners=False)
-        # print(1, output_feature.size())
-        # print(2, features1['low_level3'].size())
-        # print(3, features2['low_level3'].size())
-        out3 = self.at(output_feature, self.conv1(features1['low_level3']), self.conv1(features2['low_level3']))
-        out3 = einsum('b h i d, b h j d -> b h i j', output_feature, out3)
+        return self.classifier(torch.cat([low_level_feature, output_feature], dim=1))
 
-        # out3 = F.interpolate(low_level_feature2, size=low_level_feature1.shape[2:], mode='bilinear',
-        #                                    align_corners=False)
-        # low_level_feature3 = F.interpolate(low_level_feature3, size=low_level_feature1.shape[2:], mode='bilinear',
-        #                                    align_corners=False)
-        # out = torch.cat([low_level_feature1, low_level_feature2], dim=1)
-        # out = torch.cat([out, low_level_feature3], dim=1)
-        # out = torch.cat([out, output_feature], dim=1)
 
-        # out = self.sc3(out)
-        # print(out3.size())
-        return self.classifier(out3)
 
     def _init_weight(self):
         for m in self.modules():
@@ -371,3 +414,131 @@ def convert_to_separable_conv(module):
         new_module.add_module(name, convert_to_separable_conv(child))
     return new_module
 
+
+class CondGatedConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, label_nc, kernel_size, stride=1, padding=0, dilation=1,
+                 pad_type='zero',
+                 activation='lrelu', norm='ln', sn=False):
+        super(CondGatedConv2d, self).__init__()
+
+        self.out_channels = out_channels
+
+        # Initialize the padding scheme
+        if pad_type == 'reflect':
+            self.pad = nn.ReflectionPad2d(padding)
+        elif pad_type == 'replicate':
+            self.pad = nn.ReplicationPad2d(padding)
+        elif pad_type == 'zero':
+            self.pad = nn.ZeroPad2d(padding)
+        else:
+            assert 0, "Unsupported padding type: {}".format(pad_type)
+
+        # Initialize the normalization type
+        if norm == 'bn':
+            self.norm = nn.BatchNorm2d(out_channels)
+            self.norm_F = nn.BatchNorm2d(out_channels)
+        elif norm == 'in':
+            self.norm = nn.InstanceNorm2d(out_channels)
+            self.norm_F = nn.InstanceNorm2d(out_channels)
+        elif norm == 'ln':
+            self.norm = nn.LayerNorm(out_channels)
+            self.norm_F = nn.LayerNorm(out_channels)
+        elif norm == 'none':
+            self.norm = None
+        else:
+            assert 0, "Unsupported normalization: {}".format(norm)
+
+        # Initialize the activation funtion
+        if activation == 'relu':
+            self.activation = nn.ReLU(inplace=True)
+        elif activation == 'lrelu':
+            self.activation = nn.LeakyReLU(0.2, inplace=True)
+        elif activation == 'prelu':
+            self.activation = nn.PReLU()
+        elif activation == 'selu':
+            self.activation = nn.SELU(inplace=True)
+        elif activation == 'tanh':
+            self.activation = nn.Tanh()
+        elif activation == 'sigmoid':
+            self.activation = nn.Sigmoid()
+        elif activation == 'elu':
+            self.activation = nn.ELU(inplace=True)
+        elif activation == 'none':
+            self.activation = None
+        else:
+            assert 0, "Unsupported activation: {}".format(activation)
+
+        # Initialize the convolution layers
+        if sn:
+            self.conv2d = spectral_norm(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation))
+            self.conv2d_F = spectral_norm(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation))
+            # self.mask_conv2d = spectral_norm(
+            # nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation))
+        else:
+            self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation)
+            self.conv2d_F = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation)
+            # self.mask_conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation)
+        self.sigmoid = torch.nn.Sigmoid()
+
+        ####### mod 1 ########
+        # nhidden = out_channels // 2
+        # nhidden = 128
+        nhidden = 64
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(in_channels, nhidden, kernel_size=3, stride=stride, padding=1),
+            nn.ReLU()
+        )
+        self.mlp_gamma = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+
+        ####### mod 2 ########
+        self.mlp_shared_2 = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
+        )
+        self.mlp_shared_3 = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
+        )
+
+        self.mlp_gamma_ctx_gamma = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta_ctx_gamma = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+
+        self.mlp_gamma_ctx_beta = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta_ctx_beta = nn.Conv2d(nhidden, out_channels, kernel_size=3, padding=1)
+
+        # self.conv_x = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0)
+        self.alpha1 = nn.Parameter(torch.ones(2, 2304, 72, 124))
+        self.alpha2 = nn.Parameter(torch.ones(2, 2304, 72, 124))
+
+    def forward(self, x, gini):
+        conv = self.conv2d(x)
+        normalized = self.norm(conv)
+
+        ####### mod 2 ########
+        gini = F.interpolate(gini, size=normalized.size()[2:], mode='nearest')
+        gini_F = 1-gini
+        ctx1 = self.mlp_shared_2(gini)
+        ctx2 = self.mlp_shared_3(gini_F)
+        gamma_ctx_gamma = self.mlp_gamma_ctx_gamma(ctx1)
+        beta_ctx_gamma = self.mlp_beta_ctx_gamma(ctx1)
+        gamma_ctx_beta = self.mlp_gamma_ctx_beta(ctx2)
+        beta_ctx_beta = self.mlp_beta_ctx_beta(ctx2)
+        ####### mod 1 ########
+        # x_conv = self.conv_x(x)
+        actv = self.mlp_shared(x)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+        gamma = F.interpolate(gamma, size=gamma_ctx_gamma.size()[2:], mode='nearest')
+        beta = F.interpolate(beta, size=gamma_ctx_beta.size()[2:], mode='nearest')
+        gamma = gamma * (1. + gamma_ctx_gamma) + beta_ctx_gamma
+        beta = beta * (1. + gamma_ctx_beta) + beta_ctx_beta
+        print(gamma.size())
+        print(beta.size())
+        out_norm = normalized * (1. + gamma + self.alpha1) + beta+ self.alpha1
+
+        out = self.activation(out_norm)
+
+        return out
