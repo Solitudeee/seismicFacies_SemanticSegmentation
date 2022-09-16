@@ -548,8 +548,8 @@ class CondGatedConv2d(nn.Module):
         out_norm = conv * (1. + gamma+self.alpha1) + beta+self.alpha2
         # if self.activation:
         #     out = self.activation(out_norm)
-        out_norm = self.project1(out_norm)
-        gate = 1. + torch.tanh(out_norm)
+        gate = self.project1(out_norm)
+        gate = 1. + torch.tanh(gate)
 
         gate = F.interpolate(gate, size=norm.size()[2:], mode='nearest')
 
