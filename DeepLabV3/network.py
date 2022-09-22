@@ -1,9 +1,7 @@
-from .utils import IntermediateLayerGetter
-from ._deeplab import DeepLabHead, DeepLabHeadV3Plus, DeepLabV3
-from .backbone import resnet
-from .backbone import mobilenetv2
-
-
+from utils import IntermediateLayerGetter
+from _deeplab import DeepLabHead, DeepLabHeadV3Plus, DeepLabV3
+from backbone import resnet
+from backbone import mobilenetv2
 def _segm_resnet(name, backbone_name, num_classes, output_stride, pretrained_backbone):
     if output_stride == 8:
         replace_stride_with_dilation = [False, True, True]
@@ -20,15 +18,15 @@ def _segm_resnet(name, backbone_name, num_classes, output_stride, pretrained_bac
     low_level_planes = 256
 
     if name == 'deeplabv3plus':
-        return_layers = {'layer4': 'out', 'layer1': 'low_level'}
+        return_layers = {'layer4': 'out', 'layer1': 'low_level1','layer2': 'low_level2', 'layer3': 'low_level3'}
         classifier = DeepLabHeadV3Plus(inplanes, low_level_planes, num_classes, aspp_dilate)
     elif name == 'deeplabv3':
         return_layers = {'layer4': 'out'}
         classifier = DeepLabHead(inplanes, num_classes, aspp_dilate)
 
-    backbone = IntermediateLayerGetter(backbone, return_layers=return_layers)
+    backbone1 = IntermediateLayerGetter(backbone, return_layers=return_layers)
 
-    model = DeepLabV3(backbone, classifier)
+    model = DeepLabV3(backbone1, classifier)
     return model
 
 
@@ -109,3 +107,7 @@ def deeplabv3plus_mobilenet(num_classes=21, output_stride=8, pretrained_backbone
     """
     return _load_model('deeplabv3plus', 'mobilenetv2', num_classes, output_stride=output_stride,
                        pretrained_backbone=pretrained_backbone)
+
+
+def getNetwork():
+    return deeplabv3plus_resnet50(num_classes=6, output_stride=8, pretrained_backbone=False)
