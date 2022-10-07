@@ -423,7 +423,7 @@ def convert_to_separable_conv(module):
 class CondGatedConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, label_nc, kernel_size, stride=1, padding=0, dilation=1,
                  pad_type='zero',
-                 activation='tanh', norm='bn', sn=False):
+                 activation='relu', norm='bn', sn=False):
         super(CondGatedConv2d, self).__init__()
 
         self.out_channels = out_channels

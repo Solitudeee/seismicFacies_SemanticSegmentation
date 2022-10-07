@@ -22,7 +22,8 @@ from util.focusMap import getGini, saveGini
 data_path = '/content/drive/My Drive/dataSet'
 bin_path = '/content/drive/My Drive/dataSet/profile_list/'
 checkpointPath = "./1_checkpoint/"
-gini_path = './data/gini/'
+# gini_path = './data/gini/'
+gini_path = '/content/drive/My Drive/DeepLabV3/data/gini/'
 
 
 total_epoch = 15
@@ -66,6 +67,17 @@ def get_iou(data_list, class_num):
     print('meanIOU: ' + str(aveJ) + '\n')
 
     return aveJ, j_list, accuracy, recall
+
+def ramp_up(epoch, max_epochs, max_val, mult):
+    if epoch == 0:
+        return 0.
+    elif epoch >= max_epochs:
+        return max_val
+    return max_val * np.exp(mult * (1. - float(epoch) / max_epochs) ** 2)
+def weight_schedule(epoch, max_epochs, max_val, mult):
+    # max_val = max_val * (float(n_labeled) / n_samples)
+    return 1 - ramp_up(epoch, max_epochs, max_val, mult)
+
 
 
 # 模型加载
@@ -117,30 +129,33 @@ loss_train_dot = []
 
 pre_epoch = 0
 
-# #加载模型：
-# PATH_l = checkpointPath + "checkpoint_0_epoch-349_l.pkl"
-# checkpoint_l = torch.load(PATH_l, map_location='cpu')
-# model_left.load_state_dict(checkpoint_l['model_state_dict'])
-# opt_l.load_state_dict(checkpoint_l['optimizer_state_dict'])
-# pre_epoch = checkpoint_l['epoch']
-# iou_validation = checkpoint_l['iou_validation']
-# iou_validation1 = checkpoint_l['iou_validation1']
-# iou_validation2 = checkpoint_l['iou_validation2']
-# loss_validation = checkpoint_l['loss_validation']
-#
-# acc_validation = checkpoint_l['acc_validation']
-# acc_validation1 = checkpoint_l['acc_validation1']
-# acc_validation2 = checkpoint_l['acc_validation2']
-#
-# recall_validation = checkpoint_l['recall_validation']
-# recall_validation1 = checkpoint_l['recall_validation1']
-# recall_validation2 = checkpoint_l['recall_validation2']
+#加载模型：
+PATH_l = checkpointPath + "checkpoint_4_epoch-1200_l.pkl"
+checkpoint_l = torch.load(PATH_l, map_location='cpu')
+model_left.load_state_dict(checkpoint_l['model_state_dict'])
+opt_l.load_state_dict(checkpoint_l['optimizer_state_dict'])
+pre_epoch = checkpoint_l['epoch']
+iou_validation = checkpoint_l['iou_validation']
+iou_validation1 = checkpoint_l['iou_validation1']
+iou_validation2 = checkpoint_l['iou_validation2']
+loss_validation = checkpoint_l['loss_validation']
+
+acc_validation = checkpoint_l['acc_validation']
+acc_validation1 = checkpoint_l['acc_validation1']
+acc_validation2 = checkpoint_l['acc_validation2']
+
+recall_validation = checkpoint_l['recall_validation']
+recall_validation1 = checkpoint_l['recall_validation1']
+recall_validation2 = checkpoint_l['recall_validation2']
+
+max_k = 1500 * 5
+k = 1
 for epoch in range(pre_epoch + 1, total_epoch):
     for batchs in range(N // batch_size):
         print(epoch, '/', total_epoch, '--', batchs, '/', N // batch_size, '============================')
 
         # batchs:第batchs次训练，batch：大小
-        labeled_data = train_dataset_labeled.getData(batchs, batch_size)
+        labeled_data = train_dataset_labeled.getData(epoch,batchs, batch_size)
 
         names = labeled_data['names']
 
@@ -152,37 +167,48 @@ for epoch in range(pre_epoch + 1, total_epoch):
         # labeled_x2 = torch.FloatTensor(labeled_data['ifr2']).to(device)
 
         labeled_y = torch.LongTensor(labeled_data['facies']).to(device)
+        labeled_b = torch.LongTensor(labeled_data['border']).to(device)
 
 
         interp = nn.Upsample(size=(data_shape[1], data_shape[2]), mode='bilinear', align_corners=True).float()
+        interp_border = nn.Upsample(size=(584, 1000), mode='bilinear', align_corners=True).float()
 
 
         # *******将数据输入网络******
         # if epoch > -1:
         if hasattr(torch.cuda, 'empty_cache'):
             torch.cuda.empty_cache()
-        gini = torch.FloatTensor(getGini(gini_path, names, epoch - 1)).to(device)
+        # gini = torch.FloatTensor(getGini(gini_path, names, epoch - 1)).to(device)
+        gini = torch.FloatTensor(getGini(gini_path, names, 0)).to(device)
         if hasattr(torch.cuda, 'empty_cache'):
             torch.cuda.empty_cache()
-        pred_l = interp(model_left(labeled_x0, labeled_x1, gini))
+        pred_l_x,pred_l_border = model_left(labeled_x0, labeled_x1, gini)
         if hasattr(torch.cuda, 'empty_cache'):
             torch.cuda.empty_cache()
 
-        # else:
-        #     pred_l = interp(model_left(labeled_x0, labeled_x1))
-        #     if hasattr(torch.cuda, 'empty_cache'):
-        #         torch.cuda.empty_cache()
+        pred_l_x =interp( pred_l_x)
+        pred_l_border = interp_border(pred_l_border)
 
-
-        saveGini(pred_l, gini_path, names, epoch)
-
-        _, max_l = torch.max(pred_l, dim=1)  # 第一个模型的输出结果
-
-
-        max_l = max_l.long()
+        # _, max_l_x = torch.max(pred_l_x, dim=1)  # 第一个模型的输出结果
+        # _, max_l_border = torch.max(pred_l_border, dim=1)  # 第一个模型的输出结果
+        #
+        # max_l_x = max_l_x.long()
+        # max_l_border = max_l_border.long()
 
         # 有监督损失
-        loss = loss_func(pred_l, labeled_y)  # 第一个模型的有监督损失
+        loss_x = loss_func(pred_l_x, labeled_y)  # 第一个模型的有监督损失
+        loss_border = loss_func(pred_l_border, labeled_b)
+
+        # evaluate unsupervised cost weight
+        w = weight_schedule(k, max_k, max_val=1,mult=-5)
+        # turn it into a usable pytorch object
+        w = torch.autograd.Variable(torch.FloatTensor([w]).cuda(), requires_grad=False)
+
+        loss = loss_x + w * loss_border
+        # loss = loss_x
+        print(w)
+
+        k = k+1
 
         # 更新参数w
 
@@ -203,7 +229,7 @@ for epoch in range(pre_epoch + 1, total_epoch):
             if batchs % 10 == 0:
                 data_list = []
 
-                out = pred_l.detach().cpu().numpy()
+                out = pred_l_x.detach().cpu().numpy()
 
                 train_y = np.array(labeled_y.detach().cpu().numpy())
                 for i in range(out.shape[0]):
@@ -230,7 +256,7 @@ for epoch in range(pre_epoch + 1, total_epoch):
                 for i in range(Validation_N // Validation_batch_size):
                     print('====测试集验证====', i, '/', Validation_N // Validation_batch_size,
                           '============================')
-                    data = test_dataset.getData(i, Validation_batch_size)
+                    data = test_dataset.getData(epoch,i, Validation_batch_size)
                     data_shape = np.array(data['seismic'][0]).shape
                     validation_x0 = torch.FloatTensor(data['seismic']).to(device)
                     validation_x1 = torch.FloatTensor(data['pha']).to(device)
@@ -240,16 +266,19 @@ for epoch in range(pre_epoch + 1, total_epoch):
                     interp = nn.Upsample(size=(data_shape[1], data_shape[2]), mode='bilinear',
                                          align_corners=True).float()
                     if epoch==1 and batchs==80:
-                        gini = torch.FloatTensor(getGini(gini_path, ['300.csv','303.csv'], 0)).to(device)
-                        validation_out = interp(model_left(validation_x0, validation_x1, gini))
+                        gini = torch.FloatTensor(getGini(gini_path, ['2988.csv','2987.csv'], 0)).to(device)
                     else:
                         gini = torch.FloatTensor(getGini(gini_path, data['names'], -1)).to(device)
-                        validation_out = interp(model_left(validation_x0, validation_x1, gini))
-                    _, max_test = torch.max(validation_out, dim=1)  # 第一个模型的输出结果
 
-                    saveGini(validation_out, gini_path, data['names'], -1)
+                    validation_out_x,validation_out_b = model_left(validation_x0, validation_x1, gini)
+                    validation_out_x = interp(validation_out_x)
+                    # validation_out_x = validation_out[:,:6,:,:]
+                    # validation_out_b = validation_out[:,6:,:,:]
+                    _, max_test = torch.max(validation_out_x, dim=1)  # 第一个模型的输出结果
 
-                    loss_test = loss_func(validation_out, validation_y)
+                    saveGini(validation_out_x, gini_path, data['names'], -1)
+
+                    loss_test = loss_func(validation_out_x, validation_y)
 
                     # 计算IOU
                     data_list = []

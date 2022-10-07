@@ -5,11 +5,12 @@
 @Date ：2022/2/22 18:47
 """
 import torch
-from data.voc_dataset2 import YQYvocDataSet_Feature
+from data.voc_dataset2 import YQYvocDataSet_Feature, YQYvocDataSet_Feature_unlabel
 import torch.nn as nn
 import numpy as np
 from util.loss import CrossEntropy2d, Gini
 import network
+import pspNet
 from util import weights_init
 import collections
 from util.focusMap import getGini, saveGini
@@ -19,8 +20,8 @@ from util.focusMap import getGini, saveGini
 # checkpointPath = "./1_checkpoint/"
 # gini_path = './data/gini/'
 
-data_path = '/content/drive/My Drive/dataSet'
-bin_path = '/content/drive/My Drive/dataSet/profile_list/'
+data_path = '/content/drive/My Drive/integrity_dataSet'
+bin_path = '/content/drive/My Drive/integrity_dataSet/profile_list/'
 checkpointPath = "./1_checkpoint/"
 gini_path = './data/gini/'
 
@@ -31,8 +32,8 @@ CLASS = 6  # 类别数
 Validation_N = 82  # 测试集样本个数
 Validation_batch_size = 2
 
-N = 3000
-save_batchs = [200, 400, 600, 800,1000,1200,1499]
+N = 700
+save_batchs = [0,80, 160, 240, 350]
 labeledIndex_path = 'train.txt'
 validateIndex_path = 'validation.txt'
 
@@ -70,7 +71,7 @@ def get_iou(data_list, class_num):
 
 # 模型加载
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model_left = network.getNetwork().to(device)
+model_left = pspNet.PSPNet().to(device)
 
 
 # 初始化参数
@@ -91,6 +92,8 @@ test_dataset = YQYvocDataSet_Feature(data_path, bin_path + validateIndex_path)
 
 
 iou_validation = []
+iou_validation1 = []
+iou_validation2 = []
 loss_validation = []
 validation_class_aveJ = dict()
 validation_class_aveJ['one'] = []
@@ -101,29 +104,38 @@ validation_class_aveJ['five'] = []
 validation_class_aveJ['six'] = []
 
 acc_validation = []
+acc_validation1 = []
+acc_validation2 = []
 
 recall_validation = []
+recall_validation1 = []
+recall_validation2 = []
 
 aveJ_train = []
 aveJ_train_dot = []
 loss_train = []
 loss_train_dot = []
 
-pre_epoch = 0
+pre_epoch = -1
 
-#加载模型：
-PATH_l = checkpointPath + "checkpoint_3_epoch-1499_l.pkl"
-checkpoint_l = torch.load(PATH_l, map_location='cpu')
-model_left.load_state_dict(checkpoint_l['model_state_dict'])
-opt_l.load_state_dict(checkpoint_l['optimizer_state_dict'])
-pre_epoch = checkpoint_l['epoch']
-iou_validation = checkpoint_l['iou_validation']
-loss_validation = checkpoint_l['loss_validation']
-
-acc_validation = checkpoint_l['acc_validation']
-
-
-recall_validation = checkpoint_l['recall_validation']
+# # #加载模型：
+# PATH_l = checkpointPath + "checkpoint_0_epoch-349_l.pkl"
+# checkpoint_l = torch.load(PATH_l, map_location='cpu')
+# model_left.load_state_dict(checkpoint_l['model_state_dict'])
+# opt_l.load_state_dict(checkpoint_l['optimizer_state_dict'])
+# pre_epoch = checkpoint_l['epoch']
+# iou_validation = checkpoint_l['iou_validation']
+# iou_validation1 = checkpoint_l['iou_validation1']
+# iou_validation2 = checkpoint_l['iou_validation2']
+# loss_validation = checkpoint_l['loss_validation']
+#
+# acc_validation = checkpoint_l['acc_validation']
+# acc_validation1 = checkpoint_l['acc_validation1']
+# acc_validation2 = checkpoint_l['acc_validation2']
+#
+# recall_validation = checkpoint_l['recall_validation']
+# recall_validation1 = checkpoint_l['recall_validation1']
+# recall_validation2 = checkpoint_l['recall_validation2']
 
 for epoch in range(pre_epoch + 1, total_epoch):
     for batchs in range(N // batch_size):
@@ -138,6 +150,8 @@ for epoch in range(pre_epoch + 1, total_epoch):
         data_shape = np.array(labeled_data['seismic'][0]).shape
 
         labeled_x0 = torch.FloatTensor(labeled_data['seismic']).to(device)
+        labeled_x1 = torch.FloatTensor(labeled_data['pha']).to(device)
+        # labeled_x2 = torch.FloatTensor(labeled_data['ifr2']).to(device)
 
         labeled_y = torch.LongTensor(labeled_data['facies']).to(device)
 
@@ -146,14 +160,24 @@ for epoch in range(pre_epoch + 1, total_epoch):
 
 
         # *******将数据输入网络******
-        # if epoch > -1:
-        if hasattr(torch.cuda, 'empty_cache'):
-            torch.cuda.empty_cache()
-        pred_l = interp(model_left(labeled_x0))
-        if hasattr(torch.cuda, 'empty_cache'):
-            torch.cuda.empty_cache()
+        if epoch > 100:
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+            gini = torch.FloatTensor(getGini(gini_path, names, epoch - 1)).to(device)
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+            pred_l = interp(model_left(labeled_x0, labeled_x1, gini))
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
 
-        saveGini(pred_l, gini_path, names, 0)
+        else:
+
+            pred_l = interp(model_left(labeled_x0, labeled_x1))
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+
+
+        # saveGini(pred_l, gini_path, names, epoch - 1)
 
         _, max_l = torch.max(pred_l, dim=1)  # 第一个模型的输出结果
 
@@ -212,16 +236,14 @@ for epoch in range(pre_epoch + 1, total_epoch):
                     data = test_dataset.getData(i, Validation_batch_size)
                     data_shape = np.array(data['seismic'][0]).shape
                     validation_x0 = torch.FloatTensor(data['seismic']).to(device)
+                    validation_x1 = torch.FloatTensor(data['pha']).to(device)
                     validation_y = torch.LongTensor(data['facies']).to(device)
                     print("样本：", data['names'])
 
                     interp = nn.Upsample(size=(data_shape[1], data_shape[2]), mode='bilinear',
                                          align_corners=True).float()
-
-                    validation_out = interp(model_left(validation_x0))
+                    validation_out = interp(model_left(validation_x0, validation_x1))
                     _, max_test = torch.max(validation_out, dim=1)  # 第一个模型的输出结果
-
-                    saveGini(validation_out, gini_path, data['names'], -1)
 
                     loss_test = loss_func(validation_out, validation_y)
 
@@ -242,8 +264,14 @@ for epoch in range(pre_epoch + 1, total_epoch):
                     loss_test_list.append(loss_test.detach().cpu().numpy())
                     print('loss = {:.3f}'.format(loss_test))
                 iou_validation.append(np.mean(iou_test_list))
+                iou_validation1.append(np.mean(iou_test_list[10:30]))
+                iou_validation2.append(np.mean(np.concatenate((iou_test_list[:10], iou_test_list[-10:]))))
                 acc_validation.append(np.mean(acc_test_list))
+                acc_validation1.append(np.mean(acc_test_list[10:30]))
+                acc_validation2.append(np.mean(np.concatenate((acc_test_list[:10], acc_test_list[-10:]))))
                 recall_validation.append(np.mean(recall_test_list))
+                recall_validation1.append(np.mean(recall_test_list[10:30]))
+                recall_validation2.append(np.mean(np.concatenate((recall_test_list[:10], recall_test_list[-10:]))))
                 loss_validation.append(np.mean(loss_test_list))
                 validation_class_aveJ['one'].append(np.mean(iou_class_test_list[0]))
                 validation_class_aveJ['two'].append(np.mean(iou_class_test_list[1]))
@@ -252,16 +280,12 @@ for epoch in range(pre_epoch + 1, total_epoch):
                 validation_class_aveJ['five'].append(np.mean(iou_class_test_list[4]))
                 validation_class_aveJ['six'].append(np.mean(iou_class_test_list[5]))
                 print("iou_validation结果：", iou_validation)
+                print("iou_validation1结果：", iou_validation1)
+                print("iou_validation2结果：", iou_validation2)
                 print("loss_validation结果：", loss_validation)
-                print("acc_validation结果：", acc_validation)
-                print("recall_validation结果：", recall_validation)
                 with open("result.txt",'w') as f:
                     f.writelines("iou_validation结果：")
                     f.writelines(str(iou_validation))
-                    f.writelines("acc_validation结果：")
-                    f.writelines(str(acc_validation))
-                    f.writelines("recall_validation结果：")
-                    f.writelines(str(recall_validation))
 
                 # 保存模型
                 PATH_L = checkpointPath + "checkpoint_{}_epoch-{}_l.pkl".format(epoch, batchs)
@@ -271,10 +295,16 @@ for epoch in range(pre_epoch + 1, total_epoch):
                     'model_state_dict': model_left.state_dict(),
                     'optimizer_state_dict': opt_l.state_dict(),
                     "iou_validation": iou_validation,
+                    "iou_validation1": iou_validation1,
+                    "iou_validation2": iou_validation2,
 
                     "acc_validation": acc_validation,
+                    "acc_validation1": acc_validation1,
+                    "acc_validation2": acc_validation2,
 
                     "recall_validation": recall_validation,
+                    "recall_validation1": recall_validation1,
+                    "recall_validation2": recall_validation2,
 
                     "loss_validation": loss_validation,
                     'aveJ_train': aveJ_train,
